@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+ <rect width="512" height="512" rx="110" fill="#20534a"/>
+ <rect x="87" y="117" width="338" height="281" rx="48" fill="#ffffff" fill-opacity="0.10" stroke="#6ac6bc" stroke-width="10"/>
+ <path d="M148 203h70m-70 48h125m-125 48h89" stroke="#6ac6bc" stroke-linecap="round" stroke-width="17" opacity="0.85"/>
+ <circle cx="342" cy="267" r="62" fill="#6ac6bc"/>
+ <path d="m315 265 20 20 37-41" fill="none" stroke="#20534a" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+ <text x="141" y="177" font-family="Arial,sans-serif" font-weight="800" font-size="48" fill="white">SỔ VÁN</text>
+</svg>
