@@ -1,6 +1,12 @@
-# Sổ Ván — React web app (mobile first)
+# Sâm JQK — React web app (mobile first)
 
 Ứng dụng tính tiền bài theo từng ván, xây bằng **React 19 + Vite**. Thiết kế cho điện thoại, không yêu cầu database, backend hay đăng nhập. Có thể deploy lên GitHub Pages.
+
+## Chức năng mới (v2.1)
+
+- **Thanh toán:** chốt Done, đối soát các khoản chuyển ròng từ người thua sang người thắng; tick từng khoản, tự cập nhật Paid khi đủ và cho phép bỏ tick để sửa.
+- **QR từng thành viên:** quản lý ảnh QR trong màn Thành viên; hiển thị QR người nhận khi thanh toán, lưu trong JSON backup cục bộ.
+- **Lịch sử:** báo cáo vẫn tính cả các phiên Done và Paid. Bản cũ tự đọc được mà không mất lịch sử.
 
 ## Chức năng
 
@@ -33,27 +39,9 @@ npm run preview
 
 ## Triển khai lên GitHub Pages `nam4eb/sam-JQK`
 
-1. Repository đã tạo: **`nam4eb/sam-JQK`** (Public).
-2. Giải nén thư mục source, mở terminal tại thư mục dự án:
+Repository và workflow đã tồn tại. Để nâng cấp, clone repo, chép các file cập nhật vào thư mục clone, commit và push lên nhánh `main`. GitHub Actions sẽ tự test, build rồi deploy lên **<https://nam4eb.github.io/sam-JQK/>**.
 
-   ```bash
-   git init -b main
-   git add .
-   git commit -m "Deploy So Van mobile React app"
-   git remote add origin https://github.com/nam4eb/sam-JQK.git
-   git fetch origin main
-   git pull origin main --allow-unrelated-histories --no-rebase -m "Merge initial repository README"
-   git push -u origin main
-   ```
-
-   `git push` cần đăng nhập GitHub trên máy tính hoặc qua Git Credential Manager/SSH. **Không chia sẻ token/password với bất kỳ ai.**
-3. Vào **Settings → Pages → Build and deployment → Source = GitHub Actions**.
-4. Trong tab **Actions**, đợi workflow `Deploy React to GitHub Pages` chạy thành công. Nếu workflow chưa chạy, chọn `Run workflow`.
-5. Mở URL **<https://nam4eb.github.io/sam-JQK/>** (chỉ hoạt động sau khi deploy hoàn tất). GitHub Pages cấp HTTPS mặc định.
-
-Workflow ở `.github/workflows/deploy.yml` sẽ tự `npm install`, build Vite, upload thư mục `dist/` và deploy mỗi lần push `main`. `vite.config.js` đã đặt `base: '/sam-JQK/'` để các file tĩnh không lỗi 404 tại path của repo.
-
-**Lưu ý:** GitHub connector thông thường trong ChatGPT chỉ hỗ trợ đọc mã nguồn, không hỗ trợ push. Để triển khai, dùng GitHub web upload, GitHub Desktop hoặc Codex nếu khả dụng. Xem `DEPLOY_SAM-JQK.md`.
+Hướng dẫn chi tiết có trong **`UPGRADE_SAM-JQK.md`**.
 
 ## Dữ liệu & riêng tư
 
