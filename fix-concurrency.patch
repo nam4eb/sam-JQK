@@ -1,0 +1,292 @@
+--- a/src/cloud.js
++++ b/src/cloud.js
+@@ -1,8 +1,9 @@
+ /** Firestore gateway: one document per player and per session; transactions prevent lost writes. */
+ import { doc, collection, onSnapshot, runTransaction, writeBatch, getDoc, getDocs, setDoc, deleteDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
+ import { nowIso } from './ledger.js';
+-import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport, matchSnapshot } from './cloud-model.js';
++import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport } from './cloud-model.js';
+ import { generateInviteToken, INVITE_RE, INVITE_TTL_DAYS } from './invites.js';
++import { reconcileChange } from './concurrency.js';
+ export { emptyCloudDb, canWrite, legacyFromDevice } from './cloud-model.js';
+ 
+ export const GROUP_ID = 'sam-jqk';
+@@ -67,10 +68,11 @@
+  await runTransaction(firestore,async tx=>{
+   const [meta,snap]=await Promise.all([tx.get(mainRef(firestore)),tx.get(ref)]);
+   if(meta.exists() && meta.data()?.mode==='migrating')throw Error('Sổ đang chuyển dữ liệu, chưa thể chỉnh sửa.');
+-  if(change.previous===undefined){if(snap.exists())throw Error('Mục này đã được tạo trên thiết bị khác. Hãy thử lại.');}
+-  else if(!snap.exists() && change.kind!=='settings' || snap.exists() && !matchSnapshot(change.previous,snap.data()))throw Error('Có dữ liệu mới từ điện thoại khác. Hãy xem thay đổi và thao tác lại.');
+-  if(change.next===null){tx.delete(ref);return;}
+-  const next={...change.next,updatedAt:nowIso(),updatedBy:actorUid};
++  // Rebase safe edits (distinct rounds or transfers) on the latest Firestore version.
++  // Firestore itself retries this transaction if another write races the commit.
++  const nextValue=reconcileChange(change,snap.exists()?snap.data():undefined);
++  if(nextValue===null){tx.delete(ref);return;}
++  const next={...nextValue,updatedAt:nowIso(),updatedBy:actorUid};
+   if(change.kind==='sessions')Object.assign(next,normalizeSession(next));
+   if(change.kind==='settings')delete next.schema;
+   tx.set(ref,next);
+--- /dev/null
++++ b/src/concurrency.js
+@@ -0,0 +1,120 @@
++/**
++ * Merge independent, concurrent edits to a single Firestore session document.
++ * This runs INSIDE the Firestore transaction, with the latest committed document.
++ * Never resolve edits to the same round by last-writer-wins.
++ */
++import { MAX_ROUNDS, settlementTransfers } from './ledger.js';
++import { normalizeSession } from './cloud-model.js';
++
++const CONFLICT = 'Dữ liệu cùng ván đã thay đổi trên điện thoại khác. Hãy xem lại ván trước khi lưu.';
++const CLOSED = 'Phiên đã được chốt Done trên điện thoại khác. Ván chưa được lưu; hãy kiểm tra phiên.';
++const CHANGED = 'Phiên đã được thay đổi trên điện thoại khác. Hãy tải lại dữ liệu trước khi thao tác.';
++
++/** Stable equality, independent of Firestore's map key insertion order. */
++export function sameData(a, b) {
++  if (a === b) return true;
++  if (a == null || b == null || typeof a !== typeof b) return false;
++  if (typeof a !== 'object') return false;
++  if (Array.isArray(a) || Array.isArray(b))
++    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => sameData(v, b[i]));
++  const aKeys = Object.keys(a).filter(k => a[k] !== undefined).sort();
++  const bKeys = Object.keys(b).filter(k => b[k] !== undefined).sort();
++  return aKeys.length === bKeys.length && aKeys.every((k, i) => k === bKeys[i] && sameData(a[k], b[k]));
++}
++
++function without(obj, keys) {
++  return Object.fromEntries(Object.entries(obj || {}).filter(([k]) => !keys.includes(k)));
++}
++function sameExcept(a, b, keys) { return sameData(without(a, keys), without(b, keys)); }
++function fail(message = CHANGED) { throw new Error(message); }
++function byId(rounds) { return new Map((rounds || []).map(r => [r.id, r])); }
++function sameRoundContent(a, b) {
++  return sameExcept(a, b, ['updatedAt']);
++}
++function playerSetMatches(a, b) {
++  return sameData(a.memberIds, b.memberIds) && a.date === b.date && a.createdAt === b.createdAt;
++}
++function roundChange(before, after) {
++  if (!before || !after || before.status !== 'active' || after.status !== 'active') return null;
++  if (!sameExcept(before, after, ['rounds', 'updatedAt', 'updatedBy'])) return null;
++  const prev = byId(before.rounds), next = byId(after.rounds);
++  const added = [...next.keys()].filter(id => !prev.has(id));
++  const removed = [...prev.keys()].filter(id => !next.has(id));
++  const edited = [...prev.keys()].filter(id => next.has(id) && !sameRoundContent(prev.get(id), next.get(id)));
++  // Only opt in to lossless merge for adding ONE round or changing ONE existing round.
++  // Clearing the day, deleting rounds, and bulk edits retain strict conflict checks.
++  if (added.length === 1 && !removed.length && !edited.length)
++    return { kind: 'add', round: next.get(added[0]) };
++  if (edited.length === 1 && !removed.length && !added.length)
++    return { kind: 'edit', id: edited[0], before: prev.get(edited[0]), after: next.get(edited[0]) };
++  return null;
++}
++function paymentChange(before, after) {
++  if (!before || !after || !['done', 'paid'].includes(before.status) || !['done', 'paid'].includes(after.status)) return null;
++  if (!sameExcept(before, after, ['payments', 'status', 'paidAt', 'updatedAt', 'updatedBy'])) return null;
++  const p = before.payments || {}, n = after.payments || {};
++  const ids = [...new Set([...Object.keys(p), ...Object.keys(n)])];
++  const changed = ids.filter(id => (p[id] === true) !== (n[id] === true));
++  if (changed.length !== 1) return null;
++  return { id: changed[0], wasChecked: p[changed[0]] === true, checked: n[changed[0]] === true };
++}
++
++/**
++ * Called only if the user's original session snapshot differs from the remote one.
++ * Returns a merged session on safe non-overlapping edits. Unsafe conflicts throw.
++ */
++export function mergeSessionChange(before, after, remote) {
++  if (!before || !after || !remote) fail();
++  const rounds = roundChange(before, after);
++  if (rounds) {
++    if (remote.status !== 'active') fail(CLOSED);
++    if (!playerSetMatches(before, remote)) fail('Danh sách người chơi đã thay đổi. Hãy mở lại ván trước khi lưu.');
++    if (rounds.kind === 'add') {
++      if ((remote.rounds || []).length >= MAX_ROUNDS) fail(`Đã đạt giới hạn ${MAX_ROUNDS} ván.`);
++      if ((remote.rounds || []).some(r => r.id === rounds.round.id)) {
++        const existing = remote.rounds.find(r => r.id === rounds.round.id);
++        if (sameRoundContent(existing, rounds.round)) return remote;
++        fail(CONFLICT);
++      }
++      if (!remote.memberIds.includes(rounds.round.winnerId) || Object.keys(rounds.round.losses || {}).some(id => !remote.memberIds.includes(id) || id === rounds.round.winnerId)) fail();
++      return { ...remote, rounds: [...remote.rounds, rounds.round] };
++    }
++    const current = remote.rounds.find(r => r.id === rounds.id);
++    if (!current) fail('Ván đã bị xóa từ điện thoại khác. Không ghi đè dữ liệu.');
++    if (sameRoundContent(current, rounds.after)) return remote;
++    if (!sameRoundContent(current, rounds.before)) fail(CONFLICT);
++    return { ...remote, rounds: remote.rounds.map(r => r.id === rounds.id ? rounds.after : r) };
++  }
++  const payment = paymentChange(before, after);
++  if (payment) {
++    if (!['done', 'paid'].includes(remote.status) || !sameExcept(before, remote, ['payments', 'status', 'paidAt', 'updatedAt', 'updatedBy'])) fail();
++    const available = settlementTransfers(remote).map(t => t.id);
++    if (!available.includes(payment.id)) fail('Khoản thanh toán không còn tồn tại.');
++    const now = remote.payments?.[payment.id] === true;
++    if (now !== payment.wasChecked && now !== payment.checked) fail(CONFLICT);
++    const payments = { ...remote.payments };
++    if (payment.checked) payments[payment.id] = true; else delete payments[payment.id];
++    return normalizeSession({ ...remote, payments, paidAt: remote.paidAt || null });
++  }
++  // Metadata-only differences (writer/timestamp) should never cause a conflict.
++  if (sameExcept(before, remote, ['updatedAt', 'updatedBy'])) return { ...remote, ...after };
++  fail();
++}
++
++/** Applies one intended document change against a live transaction snapshot. */
++export function reconcileChange(change, remote) {
++  if (change.previous === undefined) {
++    if (remote !== undefined) fail('Mục đã được tạo trên một thiết bị khác.');
++    return change.next;
++  }
++  if (remote === undefined) {
++    if (change.kind === 'settings') return change.next; // initial settings doc does not yet exist
++    fail('Dữ liệu đã bị xóa từ thiết bị khác.');
++  }
++  if (sameData(change.previous, remote)) return change.next;
++  if (change.kind === 'sessions' && change.next !== null)
++    return mergeSessionChange(change.previous, change.next, remote);
++  if (sameExcept(change.previous, remote, ['updatedAt', 'updatedBy']))
++    return change.next === null ? null : { ...remote, ...change.next };
++  fail();
++}
+--- /dev/null
++++ b/src/concurrency.test.js
+@@ -0,0 +1,137 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { seed, createSession, saveRound, closeSession, togglePayment, clearSession, changePlayers, MAX_ROUNDS } from './ledger.js';
++import { sameData, reconcileChange } from './concurrency.js';
++import { diffSingle } from './cloud-model.js';
++
++function setup() {
++  let db=seed();
++  const created=createSession(db,'2026-11-09',['TV001','TV002','TV003']);
++  return { db:created.db, sid:created.session.id };
++}
++function change(before, after) { return diffSingle(before, after); }
++const round=(db,sid,winner,losses,rid=null)=>saveRound(db,sid,rid,winner,losses);
++function onRemote(c,remote) { return reconcileChange(c,remote); }
++
++test('sameData ignores Firestore map key order but still detects changed money',()=>{
++ assert.equal(sameData({b:{z:1,a:2},a:[{b:2,a:1}]},{a:[{a:1,b:2}],b:{a:2,z:1}}),true);
++ assert.equal(sameData({losses:{TV002:20}},{losses:{TV002:21}}),false);
++});
++
++test('two phones add different rounds to same session without dropping either',()=>{
++ const {db,sid}=setup();
++ const a=round(db,sid,'TV001',{TV002:10});
++ const b=round(db,sid,'TV003',{TV001:20});
++ const addA=change(db,a), addB=change(db,b);
++ const remote=onRemote(addA,db.sessions[0]);
++ const merged=onRemote(addB,remote);
++ assert.equal(merged.rounds.length,2);
++ assert.deepEqual(merged.rounds.map(x=>x.winnerId),['TV001','TV003']);
++});
++
++test('different existing rounds edited at once both survive',()=>{
++ const {db:initial,sid}=setup();
++ let db=round(initial,sid,'TV001',{TV002:10});
++ db=round(db,sid,'TV002',{TV003:15});
++ const [one,two]=db.sessions[0].rounds.map(x=>x.id);
++ const a=round(db,sid,'TV001',{TV002:40},one);
++ const b=round(db,sid,'TV002',{TV003:60},two);
++ const updated=onRemote(change(db,b),a.sessions[0]);
++ assert.equal(updated.rounds[0].losses.TV002,40);
++ assert.equal(updated.rounds[1].losses.TV003,60);
++});
++
++test('same round edited to different totals is rejected, never last-write-wins',()=>{
++ const {db:initial,sid}=setup();
++ const db=round(initial,sid,'TV001',{TV002:10});
++ const id=db.sessions[0].rounds[0].id;
++ const a=round(db,sid,'TV001',{TV002:40},id);
++ const b=round(db,sid,'TV001',{TV002:60},id);
++ assert.throws(()=>onRemote(change(db,b),a.sessions[0]),/cùng ván/);
++});
++
++test('the same round result is idempotent when updatedAt differs',()=>{
++ const {db:initial,sid}=setup();
++ const db=round(initial,sid,'TV001',{TV002:10});
++ const rid=db.sessions[0].rounds[0].id;
++ const next=round(db,sid,'TV001',{TV002:50},rid);
++ const server={...next.sessions[0],rounds:next.sessions[0].rounds.map(x=>({...x,updatedAt:'other device time'}))};
++ const merged=onRemote(change(db,next),server);
++ assert.equal(merged.rounds[0].losses.TV002,50);
++});
++
++test('late new round fails when another phone closes session',()=>{
++ const {db:initial,sid}=setup();
++ const db=round(initial,sid,'TV001',{TV002:10});
++ const stale=round(db,sid,'TV003',{TV001:15});
++ const finalized=closeSession(db,sid);
++ assert.throws(()=>onRemote(change(db,stale),finalized.sessions[0]),/đã được chốt/);
++});
++
++test('stale Done cannot finalize snapshot if another phone adds round',()=>{
++ const {db:initial,sid}=setup();
++ const db=round(initial,sid,'TV001',{TV002:10});
++ const done=closeSession(db,sid);
++ const extra=round(db,sid,'TV002',{TV003:22});
++ assert.throws(()=>onRemote(change(db,done),extra.sessions[0]),/được thay đổi/);
++});
++
++test('two phones mark different payments, status becomes paid when both done',()=>{
++ const {db:initial,sid}=setup();
++ let db=round(initial,sid,'TV001',{TV002:10,TV003:20});
++ db=closeSession(db,sid);
++ const a=togglePayment(db,sid,'TV002->TV001',true);
++ const b=togglePayment(db,sid,'TV003->TV001',true);
++ const merged=onRemote(change(db,b),a.sessions[0]);
++ assert.equal(merged.payments['TV002->TV001'],true);
++ assert.equal(merged.payments['TV003->TV001'],true);
++ assert.equal(merged.status,'paid');
++});
++
++test('marking the same payment already true is idempotent',()=>{
++ const {db:initial,sid}=setup();
++ let db=round(initial,sid,'TV001',{TV002:10,TV003:20});
++ db=closeSession(db,sid);
++ const a=togglePayment(db,sid,'TV002->TV001',true);
++ const server={...a.sessions[0],updatedBy:'other'};
++ const merged=onRemote(change(db,a),server);
++ assert.equal(merged.payments['TV002->TV001'],true);
++});
++
++test('destructive clear keeps strict conflict checking when another round was added',()=>{
++ const {db:initial,sid}=setup();
++ const db=round(initial,sid,'TV001',{TV002:10});
++ const clearing=clearSession(db,sid,true);
++ const server=round(db,sid,'TV003',{TV001:5});
++ assert.throws(()=>onRemote(change(db,clearing),server.sessions[0]),/được thay đổi/);
++});
++
++test('changes to player roster cannot be applied with stale round form',()=>{
++ const {db,sid}=setup();
++ const changed=changePlayers(db,sid,['TV001','TV002']);
++ const attempted=round(db,sid,'TV003',{TV001:10});
++ assert.throws(()=>onRemote(change(db,attempted),changed.sessions[0]),/Danh sách người chơi/);
++});
++
++test('same snapshot plus different key insertion order does not cause false conflict',()=>{
++ const {db,sid}=setup();
++ const updated=round(db,sid,'TV001',{TV002:17});
++ const old=db.sessions[0];
++ const reordered={status:old.status,rounds:old.rounds,memberIds:old.memberIds,id:old.id,date:old.date,updatedAt:old.updatedAt,createdAt:old.createdAt};
++ const result=onRemote(change(db,updated),reordered);
++ assert.equal(result.rounds[0].losses.TV002,17);
++});
++
++test('initial settings can be created when Firestore doc not yet present',()=>{
++ const {db}=setup();
++ const next={...db,settings:{...db.settings,archiveDays:9}};
++ const c=change(db,next);
++ assert.equal(c.kind,'settings');
++ assert.deepEqual(onRemote(c,undefined),next.settings);
++});
++
++test('edits to unrelated member document do not affect session mutation',()=>{
++ const {db,sid}=setup();
++ const next=round(db,sid,'TV001',{TV002:3});
++ assert.equal(onRemote(change(db,next),db.sessions[0]).rounds.length,1);
++});

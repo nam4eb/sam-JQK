@@ -1,8 +1,9 @@
 /** Firestore gateway: one document per player and per session; transactions prevent lost writes. */
 import { doc, collection, onSnapshot, runTransaction, writeBatch, getDoc, getDocs, setDoc, deleteDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { nowIso } from './ledger.js';
-import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport, matchSnapshot } from './cloud-model.js';
+import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport } from './cloud-model.js';
 import { generateInviteToken, INVITE_RE, INVITE_TTL_DAYS } from './invites.js';
+import { reconcileChange } from './concurrency.js';
 export { emptyCloudDb, canWrite, legacyFromDevice } from './cloud-model.js';
 
 export const GROUP_ID = 'sam-jqk';
@@ -67,10 +68,11 @@ export async function commitMutation(firestore,before,action,actorUid){
  await runTransaction(firestore,async tx=>{
   const [meta,snap]=await Promise.all([tx.get(mainRef(firestore)),tx.get(ref)]);
   if(meta.exists() && meta.data()?.mode==='migrating')throw Error('Sổ đang chuyển dữ liệu, chưa thể chỉnh sửa.');
-  if(change.previous===undefined){if(snap.exists())throw Error('Mục này đã được tạo trên thiết bị khác. Hãy thử lại.');}
-  else if(!snap.exists() && change.kind!=='settings' || snap.exists() && !matchSnapshot(change.previous,snap.data()))throw Error('Có dữ liệu mới từ điện thoại khác. Hãy xem thay đổi và thao tác lại.');
-  if(change.next===null){tx.delete(ref);return;}
-  const next={...change.next,updatedAt:nowIso(),updatedBy:actorUid};
+  // Rebase safe edits (distinct rounds or transfers) on the latest Firestore version.
+  // Firestore itself retries this transaction if another write races the commit.
+  const nextValue=reconcileChange(change,snap.exists()?snap.data():undefined);
+  if(nextValue===null){tx.delete(ref);return;}
+  const next={...nextValue,updatedAt:nowIso(),updatedBy:actorUid};
   if(change.kind==='sessions')Object.assign(next,normalizeSession(next));
   if(change.kind==='settings')delete next.schema;
   tx.set(ref,next);
