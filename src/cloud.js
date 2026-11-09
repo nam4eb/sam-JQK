@@ -1,7 +1,8 @@
 /** Firestore gateway: one document per player and per session; transactions prevent lost writes. */
-import { doc, collection, onSnapshot, runTransaction, writeBatch, getDoc, getDocs, setDoc, deleteDoc } from 'firebase/firestore';
+import { doc, collection, onSnapshot, runTransaction, writeBatch, getDoc, getDocs, setDoc, deleteDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { nowIso } from './ledger.js';
 import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport, matchSnapshot } from './cloud-model.js';
+import { generateInviteToken, INVITE_RE, INVITE_TTL_DAYS } from './invites.js';
 export { emptyCloudDb, canWrite, legacyFromDevice } from './cloud-model.js';
 
 export const GROUP_ID = 'sam-jqk';
@@ -11,6 +12,40 @@ const settingsRef = db => doc(db,...ROOT,'config','main');
 export const accessRef = (db,uid) => doc(db,...ROOT,'access',uid);
 export const playerRef = (db,id) => doc(db,...ROOT,'members',id);
 export const sessionRef = (db,id) => doc(db,...ROOT,'sessions',id);
+export const inviteRef = (db,token) => doc(db,...ROOT,'invites',token);
+
+/** Admin creates a random one-time link. The token is never used as a Firebase login secret. */
+export async function createInvite(db,adminUid) {
+ const token=generateInviteToken();
+ await setDoc(inviteRef(db,token),{
+  createdAt:serverTimestamp(), createdBy:adminUid,
+  expiresAt:Timestamp.fromMillis(Date.now()+INVITE_TTL_DAYS*86400000),
+ });
+ return token;
+}
+export async function revokeInvite(db,token){
+ if(!INVITE_RE.test(token))throw Error('Mã lời mời không hợp lệ.');
+ await deleteDoc(inviteRef(db,token));
+}
+/** Atomic one-use redemption: self-access and invite claim must be committed together. */
+export async function redeemInvite(db,token,user){
+ if(!INVITE_RE.test(token))throw Error('Link mời không hợp lệ. Hãy nhờ Admin tạo link mới.');
+ if(!user?.uid)throw Error('Cần đăng nhập Google trước khi nhận lời mời.');
+ const invite=inviteRef(db,token),access=accessRef(db,user.uid);
+ return runTransaction(db,async tx=>{
+  const [inv,existing]=await Promise.all([tx.get(invite),tx.get(access)]);
+  if(existing.exists())return 'already-member';
+  if(!inv.exists())throw Error('Link mời không tồn tại hoặc đã bị thu hồi.');
+  const data=inv.data();
+  if(data.claimedBy||!data.expiresAt||data.expiresAt.toMillis()<=Date.now())throw Error('Link đã được sử dụng hoặc hết hạn. Hãy nhờ Admin tạo link mới.');
+  tx.set(access,{
+   uid:user.uid,email:user.email||'',role:'member',active:true,inviteId:token,joinedAt:serverTimestamp(),
+  });
+  tx.update(invite,{claimedBy:user.uid,claimedAt:serverTimestamp()});
+  return 'joined';
+ });
+}
+
 
 export function watchGroup(firestore,onData,onError){
  const data={members:[],sessions:[],settings:{unit:'nghìn đồng',archiveDays:7},meta:{mode:'setup'}};
@@ -68,7 +103,7 @@ export async function ensureMeta(firestore){
 }
 export async function grantAccess(firestore,{uid,email,role,active=true},actorUid){
  const clean=uid.trim();if(!/^[a-zA-Z0-9:_-]{10,128}$/.test(clean))throw Error('UID không hợp lệ. Hãy sao chép UID từ trang đăng nhập.');
- if(!['admin','editor','viewer'].includes(role))throw Error('Vai trò không hợp lệ.');
+ if(!['admin','editor','viewer','member'].includes(role))throw Error('Vai trò không hợp lệ.');
  if(clean===actorUid&&(!active||role!=='admin'))throw Error('Không thể tự gỡ quyền Admin của chính mình.');
  await setDoc(accessRef(firestore,clean),{uid:clean,role,active,email:(email||'').trim().slice(0,150),updatedAt:nowIso()},{merge:true});
 }

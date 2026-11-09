@@ -3,7 +3,7 @@ import {isDatabase,settlementTransfers,nowIso} from './ledger.js';
 
 export const emptyCloudDb = () => ({schema:1,createdAt:nowIso(),updatedAt:nowIso(),members:[],sessions:[],settings:{unit:'nghìn đồng',archiveDays:7}});
 
-export const canWrite = role => role==='admin'||role==='editor';
+export const canWrite = role => ['admin','editor','member'].includes(role);
 
 function eq(a,b){return JSON.stringify(a)===JSON.stringify(b)}
 export function diffSingle(before,after){

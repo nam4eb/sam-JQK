@@ -33,3 +33,9 @@ test('migration rejects duplicate member IDs and malformed round money',()=>{
  b.sessions[0].rounds[0].losses.TV002=-5;
  assert.throws(()=>prepareImport(b),/không hợp lệ/);
 });
+
+test('member can write sessions while viewer cannot',()=>{
+ assert.equal(canWrite('member'),true);
+ assert.equal(canWrite('viewer'),false);
+ assert.equal(canWrite('admin'),true);
+});

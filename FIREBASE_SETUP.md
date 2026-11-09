@@ -1,3 +1,5 @@
+> **Cập nhật v3.1:** Với lời mời Member qua link, xem [`INVITE_SETUP.md`](INVITE_SETUP.md). Phải Publish `firestore.rules` v3.1 trước khi deploy source mới. Hướng dẫn nhập UID thủ công dưới đây vẫn hoạt động cho Admin/Editor/Viewer nếu cần.
+
 # Triển khai Sâm JQK v3.0 — Firebase Spark + GitHub Pages
 
 > **Mục tiêu:** một sổ chung cho khoảng 10 tài khoản Google, đồng bộ gần thời gian thực, không cần VPS/server tự quản, giữ website GitHub Pages `https://nam4eb.github.io/sam-JQK/`.

@@ -1,3 +1,7 @@
+# Sâm JQK v3.1 — Firebase + lời mời Member
+
+**Mới trong v3.1:** Admin tạo link mời một lần trong 7 ngày; sau Google Sign-In người được mời được tự động cấp quyền `member`, vào trang chủ; không thấy Cài đặt và không thể sửa danh sách người chơi. Xem [`INVITE_SETUP.md`](INVITE_SETUP.md) để deploy **Security Rules mới trước khi push**.
+
 # Sâm JQK v3.0 — React + Firebase Spark / Firestore
 
 Ứng dụng mobile-first tính tiền bài, đồng bộ giữa ~10 tài khoản Google bằng Cloud Firestore, phục vụ bằng **GitHub Pages**. **Không cần VPS/server tự quản.**

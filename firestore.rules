@@ -3,12 +3,15 @@ service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
     function accessPath() { return /databases/$(database)/documents/groups/sam-jqk/access/$(request.auth.uid); }
+    function accountPath(uid) { return /databases/$(database)/documents/groups/sam-jqk/access/$(uid); }
+    function invitePath(code) { return /databases/$(database)/documents/groups/sam-jqk/invites/$(code); }
     function role() {
       return signedIn() && exists(accessPath()) && get(accessPath()).data.active == true
         ? get(accessPath()).data.role : 'none';
     }
-    function isMember() { return role() in ['admin', 'editor', 'viewer']; }
+    function isMember() { return role() in ['admin', 'editor', 'viewer', 'member']; }
     function isEditor() { return role() in ['admin', 'editor']; }
+    function canEditSession() { return role() in ['admin', 'editor', 'member']; }
     function isAdmin() { return role() == 'admin'; }
     function metaPath() { return /databases/$(database)/documents/groups/sam-jqk/meta/main; }
     function migrating() { return exists(metaPath()) && get(metaPath()).data.mode == 'migrating'; }
@@ -38,18 +41,72 @@ service cloud.firestore {
         || (request.resource.data.payments.size() == request.resource.data.transferIds.size()
             && request.resource.data.payments.values().hasOnly([true]));
     }
+    // Joining cannot grant any role except 'member'. Self-access and the invite claim
+    // must be committed atomically; a random URL alone never has admin privileges.
+    function validSelfJoin(uid) {
+      let data = request.resource.data;
+      let code = data.get('inviteId', '');
+      return signedIn() && uid == request.auth.uid
+        && data.keys().hasAll(['uid','email','role','active','inviteId','joinedAt'])
+        && data.keys().hasOnly(['uid','email','role','active','inviteId','joinedAt'])
+        && data.uid == uid && data.role == 'member' && data.active == true
+        && data.email is string && data.email == request.auth.token.email
+        && code is string && code.size() == 48
+        && data.joinedAt == request.time
+        && exists(invitePath(code))
+        && get(invitePath(code)).data.expiresAt > request.time
+        && !('claimedBy' in get(invitePath(code)).data)
+        && getAfter(invitePath(code)).data.claimedBy == uid
+        && getAfter(invitePath(code)).data.claimedAt == request.time;
+    }
+    function validInviteClaim(code) {
+      return signedIn()
+        && !('claimedBy' in resource.data)
+        && resource.data.expiresAt > request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasAll(['claimedBy','claimedAt'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedBy','claimedAt'])
+        && request.resource.data.claimedBy == request.auth.uid
+        && request.resource.data.claimedAt == request.time
+        && !exists(accountPath(request.auth.uid))
+        && getAfter(accountPath(request.auth.uid)).data.role == 'member'
+        && getAfter(accountPath(request.auth.uid)).data.active == true
+        && getAfter(accountPath(request.auth.uid)).data.uid == request.auth.uid
+        && getAfter(accountPath(request.auth.uid)).data.inviteId == code
+        && getAfter(accountPath(request.auth.uid)).data.joinedAt == request.time;
+    }
     match /groups/sam-jqk {
       allow read, write: if false;
       match /access/{uid} {
         // A logged-in person can only read their own authorization document.
         allow get: if (signedIn() && request.auth.uid == uid) || isAdmin();
         allow list: if isAdmin();
-        allow create, update: if isAdmin()
-          && request.resource.data.keys().hasOnly(['uid','email','role','active','createdAt','updatedAt','name'])
+        allow create: if validSelfJoin(uid) || (isAdmin()
+          && request.resource.data.keys().hasOnly(['uid','email','role','active','createdAt','updatedAt','name','inviteId','joinedAt'])
           && request.resource.data.uid == uid
-          && request.resource.data.role in ['admin','editor','viewer']
+          && request.resource.data.role in ['admin','editor','viewer','member']
+          && request.resource.data.active is bool);
+        allow update: if isAdmin()
+          && request.resource.data.keys().hasOnly(['uid','email','role','active','createdAt','updatedAt','name','inviteId','joinedAt'])
+          && request.resource.data.uid == uid
+          && request.resource.data.role in ['admin','editor','viewer','member']
           && request.resource.data.active is bool;
         allow delete: if isAdmin() && uid != request.auth.uid;
+      }
+      match /invites/{code} {
+        // Bearer links contain 192 bits of entropy. Never allow listing by non-admins.
+        allow get: if signedIn();
+        allow list: if isAdmin();
+        allow create: if isAdmin()
+          && code.size() == 48
+          && request.resource.data.keys().hasAll(['createdAt','createdBy','expiresAt'])
+          && request.resource.data.keys().hasOnly(['createdAt','createdBy','expiresAt'])
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.expiresAt is timestamp
+          && request.resource.data.expiresAt > request.time
+          && request.resource.data.expiresAt < request.time + duration.value(8, 'd');
+        allow update: if validInviteClaim(code);
+        allow delete: if isAdmin();
       }
       match /meta/{id} {
         allow get: if isMember();
@@ -75,15 +132,15 @@ service cloud.firestore {
       }
       match /sessions/{sid} {
         allow read: if isMember();
-        allow create: if importer() || (isEditor() && ready() && safeSession()
+        allow create: if importer() || (canEditSession() && ready() && safeSession()
           && request.resource.data.id == sid && request.resource.data.status == 'active'
           && request.resource.data.rounds.size() == 0);
-        allow update: if importer() || (isEditor() && ready() && safeSession() && validPaid()
+        allow update: if importer() || (canEditSession() && ready() && safeSession() && validPaid()
           && request.resource.data.id == sid
           && (resource.data.status == 'active'
               || (request.resource.data.status in ['done','paid']
                   && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['payments','status','paidAt','updatedAt','updatedBy']))));
-        allow delete: if isEditor() && ready() && resource.data.status == 'active'
+        allow delete: if canEditSession() && ready() && resource.data.status == 'active'
           && resource.data.rounds.size() == 0;
       }
     }
