@@ -1,4 +1,4 @@
-/** Sâm JQK business rules, React-independent. Data stored only in browser. */
+/** Sâm JQK business rules, React-independent. Compatible with legacy localStorage backups. */
 export const STORE_KEY = 'so-van/mobile-ledger/v1'; // compatible with previous non-React version
 export const MAX_MEMBERS = 100;
 export const MAX_PLAYERS = 10;
@@ -65,7 +65,7 @@ export function closeSession(db,sid,auto=false){
  const snapshot=sessionStats(s);
  const transfers=settlementTransfers({...s,snapshot,status:'done'});
  const completed=transfers.length===0;
- return {...db,sessions:db.sessions.map(x=>x.id===sid?{...x,status:completed?'paid':'done',snapshot,payments:{},paidAt:completed?nowIso():null,closedAt:nowIso(),autoClosed:auto,updatedAt:nowIso()}:x)};
+ return {...db,sessions:db.sessions.map(x=>x.id===sid?{...x,status:completed?'paid':'done',snapshot,payments:{},transferIds:transfers.map(t=>t.id),paidAt:completed?nowIso():null,closedAt:nowIso(),autoClosed:auto,updatedAt:nowIso()}:x)};
 }
 
 /** Split net balances into specific debtor-to-creditor amounts; stable based on session player order. */
@@ -95,7 +95,7 @@ export function togglePayment(db,sid,transferId,checked){
  if(!s||!['done','paid'].includes(s.status))throw Error('Cần chốt Done trước khi xác nhận chuyển tiền.');
  const transfers=settlementTransfers(s);
  if(!transfers.some(x=>x.id===transferId))throw Error('Không tìm thấy khoản chuyển tiền.');
- const payments={...s.payments,[transferId]:Boolean(checked)};
+ const payments={...s.payments};if(checked)payments[transferId]=true;else delete payments[transferId];
  const allPaid=transfers.every(t=>payments[t.id]===true);
  return {...db,sessions:db.sessions.map(x=>x.id===sid?{...x,payments,status:allPaid?'paid':'done',paidAt:allPaid?nowIso():null,updatedAt:nowIso()}:x)};
 }

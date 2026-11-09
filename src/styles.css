@@ -62,3 +62,16 @@
  .member-qr-mini{display:none}
  .status{white-space:normal;text-align:center}
 }
+
+/* Firebase authentication, account access, and migration controls */
+.auth-screen{min-height:100dvh;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,#e6f2ee,#f7fbf8)}
+.auth-card{width:min(100%,465px);background:#fff;padding:clamp(24px,5vw,40px);border:1px solid #dce8e1;border-radius:24px;box-shadow:0 14px 60px #143e301a;text-align:center}
+.auth-logo{font-size:42px;font-weight:900;color:#19594e;letter-spacing:-3px;margin-bottom:12px}.auth-logo span{color:#eda555}
+.auth-card h1{font-size:29px;line-height:1.2;margin:12px 0}.auth-card p{line-height:1.65;color:#496359}
+.auth-login{width:100%;min-height:52px;margin-top:18px}.auth-hint{font-size:13px}.auth-error{border:1px solid #fecaca;background:#fff1f2;color:#9b1c1c!important;border-radius:12px;padding:10px;overflow-wrap:anywhere}
+.uid-box{margin:15px 0;padding:13px;background:#eef6f2;border:1px solid #c9dfd2;border-radius:12px;display:flex;flex-direction:column;align-items:flex-start;gap:6px;max-width:100%}
+.uid-box code{font-size:12px;word-break:break-all;color:#0f4136}.uid-box small{color:#607269}
+.auth-card .uid-box .btn{align-self:center}
+.access-roster{display:grid;gap:8px;margin:14px 0 18px}.access-member{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px;border:1px solid #e1e9e5;border-radius:12px;flex-wrap:wrap}.access-member>div{flex:1;min-width:160px;display:grid;gap:3px}.access-member small{font-size:11px;color:#63796f;overflow-wrap:anywhere}.access-member select{min-height:34px;border:1px solid #d2e0da;border-radius:9px;padding:6px}
+.settings-warning{font-size:13px;color:#80552c}.cloud-error-banner{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:400;background:#fff1f2;border:1px solid #efb3bd;color:#962b38;box-shadow:0 10px 25px #0002;border-radius:12px;max-width:min(92vw,600px);padding:12px 18px;font-size:14px}.cloud-error-banner button{margin-left:10px;font-weight:700;text-decoration:underline}
+@media(max-width:480px){.access-member{align-items:flex-start}.access-member select{max-width:100px}.uid-box{overflow-wrap:anywhere}}

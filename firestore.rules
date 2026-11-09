@@ -1,0 +1,92 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function accessPath() { return /databases/$(database)/documents/groups/sam-jqk/access/$(request.auth.uid); }
+    function role() {
+      return signedIn() && exists(accessPath()) && get(accessPath()).data.active == true
+        ? get(accessPath()).data.role : 'none';
+    }
+    function isMember() { return role() in ['admin', 'editor', 'viewer']; }
+    function isEditor() { return role() in ['admin', 'editor']; }
+    function isAdmin() { return role() == 'admin'; }
+    function metaPath() { return /databases/$(database)/documents/groups/sam-jqk/meta/main; }
+    function migrating() { return exists(metaPath()) && get(metaPath()).data.mode == 'migrating'; }
+    function ready() { return exists(metaPath()) && get(metaPath()).data.mode == 'ready'; }
+    function importer() { return isAdmin() && migrating() && get(metaPath()).data.migrationOwner == request.auth.uid; }
+    function safePlayer() {
+      return request.resource.data.keys().hasOnly(['id','name','active','createdAt','updatedAt','updatedBy','qrImage'])
+        && request.resource.data.id is string
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 100
+        && request.resource.data.active is bool
+        && request.resource.data.get('qrImage','') is string
+        && request.resource.data.get('qrImage','').size() <= 700000;
+    }
+    function safeSession() {
+      return request.resource.data.keys().hasOnly(['id','date','memberIds','rounds','status','createdAt','updatedAt','updatedBy','snapshot','payments','transferIds','paidAt','closedAt','autoClosed'])
+        && request.resource.data.id is string
+        && request.resource.data.date is string
+        && request.resource.data.memberIds is list && request.resource.data.memberIds.size() <= 10
+        && request.resource.data.rounds is list && request.resource.data.rounds.size() <= 200
+        && request.resource.data.status in ['active','done','paid']
+        && request.resource.data.get('transferIds',[]) is list
+        && request.resource.data.get('payments',{}) is map
+        && request.resource.data.get('payments',{}).keys().hasOnly(request.resource.data.get('transferIds',[]));
+    }
+    function validPaid() {
+      return request.resource.data.status != 'paid'
+        || (request.resource.data.payments.size() == request.resource.data.transferIds.size()
+            && request.resource.data.payments.values().hasOnly([true]));
+    }
+    match /groups/sam-jqk {
+      allow read, write: if false;
+      match /access/{uid} {
+        // A logged-in person can only read their own authorization document.
+        allow get: if (signedIn() && request.auth.uid == uid) || isAdmin();
+        allow list: if isAdmin();
+        allow create, update: if isAdmin()
+          && request.resource.data.keys().hasOnly(['uid','email','role','active','createdAt','updatedAt','name'])
+          && request.resource.data.uid == uid
+          && request.resource.data.role in ['admin','editor','viewer']
+          && request.resource.data.active is bool;
+        allow delete: if isAdmin() && uid != request.auth.uid;
+      }
+      match /meta/{id} {
+        allow get: if isMember();
+        allow list: if false;
+        allow create, update: if id == 'main' && isAdmin()
+          && request.resource.data.mode in ['ready','migrating'];
+        allow delete: if false;
+      }
+      match /config/{id} {
+        allow read: if isMember();
+        allow create, update: if id == 'main' && isAdmin()
+          && (ready() || importer())
+          && request.resource.data.get('unit','') is string
+          && request.resource.data.unit.size() <= 24
+          && request.resource.data.archiveDays is int
+          && request.resource.data.archiveDays >= 1 && request.resource.data.archiveDays <= 365;
+        allow delete: if false;
+      }
+      match /members/{mid} {
+        allow read: if isMember();
+        allow create, update: if importer() || (isEditor() && ready() && safePlayer() && request.resource.data.id == mid);
+        allow delete: if false;
+      }
+      match /sessions/{sid} {
+        allow read: if isMember();
+        allow create: if importer() || (isEditor() && ready() && safeSession()
+          && request.resource.data.id == sid && request.resource.data.status == 'active'
+          && request.resource.data.rounds.size() == 0);
+        allow update: if importer() || (isEditor() && ready() && safeSession() && validPaid()
+          && request.resource.data.id == sid
+          && (resource.data.status == 'active'
+              || (request.resource.data.status in ['done','paid']
+                  && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['payments','status','paidAt','updatedAt','updatedBy']))));
+        allow delete: if isEditor() && ready() && resource.data.status == 'active'
+          && resource.data.rounds.size() == 0;
+      }
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
