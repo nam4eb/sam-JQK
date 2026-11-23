@@ -2,7 +2,7 @@
 import { doc, collection, onSnapshot, runTransaction, writeBatch, getDoc, getDocs, setDoc, deleteDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { nowIso } from './ledger.js';
 import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport } from './cloud-model.js';
-import { generateInviteToken, INVITE_RE, INVITE_TTL_DAYS } from './invites.js';
+import { generateInviteToken, INVITE_RE, INVITE_TTL_MS } from './invites.js';
 import { reconcileChange } from './concurrency.js';
 export { emptyCloudDb, canWrite, legacyFromDevice } from './cloud-model.js';
 
@@ -15,12 +15,13 @@ export const playerRef = (db,id) => doc(db,...ROOT,'members',id);
 export const sessionRef = (db,id) => doc(db,...ROOT,'sessions',id);
 export const inviteRef = (db,token) => doc(db,...ROOT,'invites',token);
 
-/** Admin creates a random one-time link. The token is never used as a Firebase login secret. */
+/** One high-entropy invitation can onboard multiple DIFFERENT UIDs within 60 minutes. */
+export const inviteClaimRef = (db,token,uid) => doc(db,...ROOT,'invites',token,'claims',uid);
 export async function createInvite(db,adminUid) {
  const token=generateInviteToken();
  await setDoc(inviteRef(db,token),{
-  createdAt:serverTimestamp(), createdBy:adminUid,
-  expiresAt:Timestamp.fromMillis(Date.now()+INVITE_TTL_DAYS*86400000),
+  mode:'multi', createdAt:serverTimestamp(), createdBy:adminUid,
+  expiresAt:Timestamp.fromMillis(Date.now()+INVITE_TTL_MS),
  });
  return token;
 }
@@ -28,23 +29,34 @@ export async function revokeInvite(db,token){
  if(!INVITE_RE.test(token))throw Error('Mã lời mời không hợp lệ.');
  await deleteDoc(inviteRef(db,token));
 }
-/** Atomic one-use redemption: self-access and invite claim must be committed together. */
+/** Atomic per-UID claim + access; the reusable invite document is never modified. */
 export async function redeemInvite(db,token,user){
  if(!INVITE_RE.test(token))throw Error('Link mời không hợp lệ. Hãy nhờ Admin tạo link mới.');
  if(!user?.uid)throw Error('Cần đăng nhập Google trước khi nhận lời mời.');
- const invite=inviteRef(db,token),access=accessRef(db,user.uid);
- return runTransaction(db,async tx=>{
-  const [inv,existing]=await Promise.all([tx.get(invite),tx.get(access)]);
-  if(existing.exists())return 'already-member';
+ const invite=inviteRef(db,token),access=accessRef(db,user.uid),claim=inviteClaimRef(db,token,user.uid);
+ try{return await runTransaction(db,async tx=>{
+  // All reads precede both writes. Concurrent claims by different UIDs do not
+  // modify the same invite, so they can succeed independently.
+  const [inv,existing,used]=await Promise.all([tx.get(invite),tx.get(access),tx.get(claim)]);
+  if(existing.exists()){
+   if(existing.data().active===true)return 'already-member';
+   throw Error('Tài khoản đã bị thu hồi quyền. Hãy liên hệ Admin.');
+  }
   if(!inv.exists())throw Error('Link mời không tồn tại hoặc đã bị thu hồi.');
-  const data=inv.data();
-  if(data.claimedBy||!data.expiresAt||data.expiresAt.toMillis()<=Date.now())throw Error('Link đã được sử dụng hoặc hết hạn. Hãy nhờ Admin tạo link mới.');
+  // Firestore Security Rules enforce the 60-minute limit using SERVER request.time.
+  // Do not use Date.now() here: a phone with a wrong clock must not decide access.
+  if(inv.data().mode!=='multi'||inv.data().claimedBy||!inv.data().expiresAt)throw Error('Link mời thuộc phiên bản cũ hoặc không hợp lệ. Hãy nhờ Admin tạo link mới.');
+  if(used.exists())throw Error('Tài khoản này đã sử dụng link trước đó. Hãy liên hệ Admin để cấp lại quyền.');
   tx.set(access,{
    uid:user.uid,email:user.email||'',role:'member',active:true,inviteId:token,joinedAt:serverTimestamp(),
   });
-  tx.update(invite,{claimedBy:user.uid,claimedAt:serverTimestamp()});
+  tx.set(claim,{uid:user.uid,joinedAt:serverTimestamp()});
   return 'joined';
- });
+ });}
+ catch(error){
+  if(error?.code==='permission-denied')throw Error('Không thể nhận lời mời: link có thể đã hết 1 giờ, bị thu hồi hoặc Firestore Rules chưa cập nhật.');
+  throw error;
+ }
 }
 
 

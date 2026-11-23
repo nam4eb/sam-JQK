@@ -1,0 +1,345 @@
+diff --git a/src/invites.js b/src/invites.js
+--- a/src/invites.js
++++ b/src/invites.js
+@@ -1,6 +1,7 @@
+-/** Invitation links are high-entropy one-use bearer tokens (192-bit random). */
++/** A 192-bit random bearer link can invite different Google UIDs for up to one hour. */
+ export const INVITE_RE = /^[0-9a-f]{48}$/;
+-export const INVITE_TTL_DAYS = 7;
++export const INVITE_TTL_MINUTES = 60;
++export const INVITE_TTL_MS = INVITE_TTL_MINUTES * 60 * 1000;
+ 
+ export function generateInviteToken(cryptoSource = globalThis.crypto) {
+   if (!cryptoSource?.getRandomValues) throw new Error('Thiết bị không hỗ trợ tạo link mời an toàn.');
+@@ -19,8 +20,25 @@
+   url.hash = `invite=${token}`;
+   return url.toString();
+ }
++export function timestampMillis(value) {
++  if (typeof value?.toMillis === 'function') return value.toMillis();
++  if (typeof value?.seconds === 'number') return value.seconds * 1000 + Math.floor((value.nanoseconds || 0) / 1e6);
++  return NaN;
++}
++export function inviteValidUntil(invite) {
++  // Server Rules also cap validity at createdAt + 1 hour, irrespective of clock skew.
++  const created = timestampMillis(invite?.createdAt);
++  const expires = timestampMillis(invite?.expiresAt);
++  if (!Number.isFinite(created) || !Number.isFinite(expires)) return NaN;
++  return Math.min(expires, created + INVITE_TTL_MS);
++}
+ export function inviteExpired(expiresAt, atMillis = Date.now()) {
+-  if (typeof expiresAt?.toMillis === 'function') return expiresAt.toMillis() <= atMillis;
+-  if (typeof expiresAt?.seconds === 'number') return expiresAt.seconds * 1000 <= atMillis;
+-  return true;
++  return !(timestampMillis(expiresAt) > atMillis);
+ }
++export function inviteIsReusable(invite, atMillis = Date.now()) {
++  // v3.1 one-use (7-day) links lack mode='multi' and must never reactivate.
++  if (!invite || invite.mode !== 'multi' || invite.claimedBy) return false;
++  const created = timestampMillis(invite.createdAt);
++  const deadline = inviteValidUntil(invite);
++  return Number.isFinite(created) && Number.isFinite(deadline) && deadline > created && deadline > atMillis;
++}
+diff --git a/src/invites.test.js b/src/invites.test.js
+--- a/src/invites.test.js
++++ b/src/invites.test.js
+@@ -1,25 +1,48 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import {generateInviteToken, parseInviteToken, inviteLink, inviteExpired} from './invites.js';
++import {generateInviteToken,parseInviteToken,inviteLink,inviteExpired,inviteIsReusable,inviteValidUntil,INVITE_TTL_MINUTES,INVITE_TTL_MS} from './invites.js';
+ 
+-test('invite is random 192 bit lowercase hex', () => {
++const stamp = millis => ({seconds:Math.floor(millis/1000),nanoseconds:(millis%1000)*1e6});
++
++test('reusable invitation token is 192-bit random and URL-safe',()=>{
+  const a=generateInviteToken(),b=generateInviteToken();
+  assert.match(a,/^[0-9a-f]{48}$/);assert.notEqual(a,b);
++ assert.equal(INVITE_TTL_MINUTES,60);assert.equal(INVITE_TTL_MS,3600000);
+ });
+-test('invite token round trips in GitHub Pages URL hash',()=>{
++test('GitHub Pages URL hash correctly retains invite token',()=>{
+  const token='a'.repeat(48);const url=inviteLink(token,'https://nam4eb.github.io');
+  assert.equal(url,`https://nam4eb.github.io/sam-JQK/#invite=${token}`);
+  assert.equal(parseInviteToken(new URL(url).hash),token);
+  assert.equal(parseInviteToken('#/settings'),null);
+  assert.equal(parseInviteToken('#invite=bad'),null);
+ });
+-test('invite expiry respects Firestore timestamps',()=>{
++test('multi invite is valid for multiple different UIDs within one hour',()=>{
++ const start=1000000000000;
++ const invite={mode:'multi',createdAt:stamp(start),expiresAt:stamp(start+INVITE_TTL_MS)};
++ assert.equal(inviteIsReusable(invite,start),true);
++ assert.equal(inviteIsReusable(invite,start+3599999),true);
++ assert.equal(inviteIsReusable(invite,start+3600000),false);
++ // Validation does not consume or mutate this reusable invite document.
++ assert.equal(inviteIsReusable(invite,start+1000),true);
++ assert.equal(inviteValidUntil(invite),start+3600000);
++});
++test('expiry is capped to server creation time + 60 minutes',()=>{
++ const start=1000000000000;
++ const clockAhead={mode:'multi',createdAt:stamp(start),expiresAt:stamp(start+3600500)};
++ assert.equal(inviteValidUntil(clockAhead),start+3600000);
++ assert.equal(inviteIsReusable(clockAhead,start+3600000),false);
++});
++test('old seven-day single-use invites cannot be silently reactivated',()=>{
++ const start=1000000000000;
++ assert.equal(inviteIsReusable({createdAt:stamp(start),expiresAt:stamp(start+7*86400000)},start+10),false);
++ assert.equal(inviteIsReusable({mode:'multi',createdAt:stamp(start),expiresAt:stamp(start+3600000),claimedBy:'uid'},start+10),false);
++ assert.equal(inviteIsReusable({mode:'multi',createdAt:stamp(start),expiresAt:stamp(start-1000)},start),false);
++ assert.equal(inviteIsReusable({mode:'multi',expiresAt:stamp(start+3600000)},start),false);
++});
++test('Firestore timestamp and token input validation',()=>{
+  assert.equal(inviteExpired({seconds:1000},999000),false);
+  assert.equal(inviteExpired({seconds:1000},1000000),true);
+- assert.equal(inviteExpired({toMillis:()=>2000},1999),false);
+  assert.equal(inviteExpired(null),true);
+-});
+-test('reject forged short tokens and missing secure random',()=>{
+  assert.throws(()=>inviteLink('bad','https://nam4eb.github.io'));
+  assert.throws(()=>generateInviteToken({}));
+ });
+diff --git a/src/InviteAdminPanel.jsx b/src/InviteAdminPanel.jsx
+--- a/src/InviteAdminPanel.jsx
++++ b/src/InviteAdminPanel.jsx
+@@ -1,10 +1,14 @@
+-import React,{useMemo,useState} from 'react';
+-import {inviteExpired,inviteLink,INVITE_TTL_DAYS} from './invites.js';
++import React,{useEffect,useMemo,useState} from 'react';
++import {inviteIsReusable,inviteLink,inviteValidUntil,INVITE_TTL_MINUTES} from './invites.js';
+ 
+ function timeOf(value){
+- if(!value)return '—';
+- const millis=value.toMillis?.()??(typeof value.seconds==='number'?value.seconds*1000:NaN);
+- return Number.isFinite(millis)?new Date(millis).toLocaleString('vi-VN'):'—';
++ if(!Number.isFinite(value))return '—';
++ return new Date(value).toLocaleString('vi-VN');
++}
++function remaining(deadline,now){
++ const sec=Math.max(0,Math.ceil((deadline-now)/1000));
++ if(sec===0)return 'Đã hết hạn';
++ return `${Math.floor(sec/60)} phút ${sec%60} giây`;
+ }
+ function CopyLink({url}){
+  const [copied,setCopied]=useState(false);
+@@ -12,20 +16,23 @@
+ }
+ export default function InviteAdminPanel({invites,onCreate,onRevoke}){
+  const [busy,setBusy]=useState(false),[error,setError]=useState(''),[newUrl,setNewUrl]=useState('');
+- const active=useMemo(()=>invites.filter(i=>!i.claimedBy&&!inviteExpired(i.expiresAt)).sort((a,b)=>((b.createdAt?.seconds||0)-(a.createdAt?.seconds||0))),[invites]);
++ const [clock,setClock]=useState(Date.now());
++ useEffect(()=>{const t=setInterval(()=>setClock(Date.now()),1000);return()=>clearInterval(t)},[]);
++ const active=useMemo(()=>invites.filter(i=>inviteIsReusable(i,clock)).sort((a,b)=>((b.createdAt?.seconds||0)-(a.createdAt?.seconds||0))),[invites,clock]);
+  const create=async()=>{setBusy(true);setError('');try{const token=await onCreate();setNewUrl(inviteLink(token,window.location.origin,import.meta.env.BASE_URL));}catch(e){setError(e.message||'Không tạo được link mời.')}finally{setBusy(false)}};
+- const revoke=async token=>{if(!window.confirm('Thu hồi link mời này? Người chưa dùng link sẽ không thể tham gia.'))return;setBusy(true);setError('');try{await onRevoke(token);setNewUrl('')}catch(e){setError(e.message||'Không thu hồi được link.')}finally{setBusy(false)}};
++ const revoke=async token=>{if(!window.confirm('Thu hồi link mời này? Người chưa tham gia sẽ không thể dùng link để vào nhóm.'))return;setBusy(true);setError('');try{await onRevoke(token);setNewUrl('')}catch(e){setError(e.message||'Không thu hồi được link.')}finally{setBusy(false)}};
+  return <section className="settings-card card gap-above invite-card">
+   <h3>Link mời thành viên</h3>
+-  <p>Admin tạo link dùng <b>một lần</b>, có hạn <b>{INVITE_TTL_DAYS} ngày</b>. Người được mời mở link, đăng nhập Google và tự nhận quyền <b>Member</b>. Không cần gửi UID thủ công.</p>
+-  <button type="button" className="btn primary" disabled={busy} onClick={create}>Tạo link mời Member</button>
+-  {newUrl&&<div className="invite-link-box"><label htmlFor="invite-created-link">Link mời vừa tạo</label><input id="invite-created-link" aria-label="Link mời" readOnly value={newUrl} onFocus={e=>e.target.select()}/><CopyLink url={newUrl}/><small>Chỉ gửi cho đúng người được mời. Ai mở link trước và đăng nhập thành công sẽ nhận quyền.</small></div>}
++  <p>Admin tạo <b>một link dùng chung cho nhiều người</b> trong vòng <b>{INVITE_TTL_MINUTES} phút</b>. Mỗi người mở link, đăng nhập Google và tự nhận quyền <b>Member</b>; không cần gửi UID.</p>
++  <button type="button" className="btn primary" disabled={busy} onClick={create}>Tạo link mời 1 giờ</button>
++  {newUrl&&<div className="invite-link-box"><label htmlFor="invite-created-link">Link mời vừa tạo</label><input id="invite-created-link" aria-label="Link mời" readOnly value={newUrl} onFocus={e=>e.target.select()}/><CopyLink url={newUrl}/><small>Có thể gửi cùng một link cho tất cả bạn bè trong 1 giờ. Mỗi người phải đăng nhập bằng tài khoản Google riêng.</small></div>}
+   {error&&<p className="auth-error" role="alert">{error}</p>}
+-  <h4>Link chưa sử dụng ({active.length})</h4>
+-  {active.length===0?<p className="muted-inline">Chưa có link mời đang hoạt động.</p>:<div className="invite-list">{active.map(i=>{
++  <h4>Link còn hiệu lực ({active.length})</h4>
++  {active.length===0?<p className="muted-inline">Chưa có link mời đang hoạt động. Các link cũ dùng một lần sẽ không hoạt động lại.</p>:<div className="invite-list">{active.map(i=>{
+     const url=inviteLink(i.id,window.location.origin,import.meta.env.BASE_URL);
+-    return <div className="invite-list-item" key={i.id}><div><strong>Member · Link dùng một lần</strong><small>Hết hạn: {timeOf(i.expiresAt)}</small></div><div className="invite-list-actions"><CopyLink url={url}/><button type="button" className="btn outline compact" disabled={busy} onClick={()=>revoke(i.id)}>Thu hồi</button></div></div>
++    const deadline=inviteValidUntil(i);
++    return <div className="invite-list-item" key={i.id}><div><strong>Member · Dùng được cho nhiều người</strong><small>Hết hạn: {timeOf(deadline)} · Còn {remaining(deadline,clock)}</small></div><div className="invite-list-actions"><CopyLink url={url}/><button type="button" className="btn outline compact" disabled={busy} onClick={()=>revoke(i.id)}>Thu hồi</button></div></div>
+   })}</div>}
+-  <p className="settings-warning">Không chia sẻ link mời trong nhóm công khai. Sau khi người được mời sử dụng, link tự vô hiệu. Admin vẫn có thể thu hồi quyền trong danh sách truy cập.</p>
++  <p className="settings-warning">Ai có link trong thời hạn đều có thể tự nhận quyền Member. Chỉ gửi trong nhóm tin cậy. Hết hạn/thu hồi link không xóa quyền của người đã tham gia; Admin gỡ tài khoản riêng trong danh sách truy cập.</p>
+  </section>;
+ }
+diff --git a/src/cloud.js b/src/cloud.js
+--- a/src/cloud.js
++++ b/src/cloud.js
+@@ -2,7 +2,7 @@
+ import { doc, collection, onSnapshot, runTransaction, writeBatch, getDoc, getDocs, setDoc, deleteDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
+ import { nowIso } from './ledger.js';
+ import { emptyCloudDb, canWrite, diffSingle, normalizeSession, prepareImport } from './cloud-model.js';
+-import { generateInviteToken, INVITE_RE, INVITE_TTL_DAYS } from './invites.js';
++import { generateInviteToken, INVITE_RE, INVITE_TTL_MS } from './invites.js';
+ import { reconcileChange } from './concurrency.js';
+ export { emptyCloudDb, canWrite, legacyFromDevice } from './cloud-model.js';
+ 
+@@ -15,12 +15,13 @@
+ export const sessionRef = (db,id) => doc(db,...ROOT,'sessions',id);
+ export const inviteRef = (db,token) => doc(db,...ROOT,'invites',token);
+ 
+-/** Admin creates a random one-time link. The token is never used as a Firebase login secret. */
++/** One high-entropy invitation can onboard multiple DIFFERENT UIDs within 60 minutes. */
++export const inviteClaimRef = (db,token,uid) => doc(db,...ROOT,'invites',token,'claims',uid);
+ export async function createInvite(db,adminUid) {
+  const token=generateInviteToken();
+  await setDoc(inviteRef(db,token),{
+-  createdAt:serverTimestamp(), createdBy:adminUid,
+-  expiresAt:Timestamp.fromMillis(Date.now()+INVITE_TTL_DAYS*86400000),
++  mode:'multi', createdAt:serverTimestamp(), createdBy:adminUid,
++  expiresAt:Timestamp.fromMillis(Date.now()+INVITE_TTL_MS),
+  });
+  return token;
+ }
+@@ -28,23 +29,34 @@
+  if(!INVITE_RE.test(token))throw Error('Mã lời mời không hợp lệ.');
+  await deleteDoc(inviteRef(db,token));
+ }
+-/** Atomic one-use redemption: self-access and invite claim must be committed together. */
++/** Atomic per-UID claim + access; the reusable invite document is never modified. */
+ export async function redeemInvite(db,token,user){
+  if(!INVITE_RE.test(token))throw Error('Link mời không hợp lệ. Hãy nhờ Admin tạo link mới.');
+  if(!user?.uid)throw Error('Cần đăng nhập Google trước khi nhận lời mời.');
+- const invite=inviteRef(db,token),access=accessRef(db,user.uid);
+- return runTransaction(db,async tx=>{
+-  const [inv,existing]=await Promise.all([tx.get(invite),tx.get(access)]);
+-  if(existing.exists())return 'already-member';
++ const invite=inviteRef(db,token),access=accessRef(db,user.uid),claim=inviteClaimRef(db,token,user.uid);
++ try{return await runTransaction(db,async tx=>{
++  // All reads precede both writes. Concurrent claims by different UIDs do not
++  // modify the same invite, so they can succeed independently.
++  const [inv,existing,used]=await Promise.all([tx.get(invite),tx.get(access),tx.get(claim)]);
++  if(existing.exists()){
++   if(existing.data().active===true)return 'already-member';
++   throw Error('Tài khoản đã bị thu hồi quyền. Hãy liên hệ Admin.');
++  }
+   if(!inv.exists())throw Error('Link mời không tồn tại hoặc đã bị thu hồi.');
+-  const data=inv.data();
+-  if(data.claimedBy||!data.expiresAt||data.expiresAt.toMillis()<=Date.now())throw Error('Link đã được sử dụng hoặc hết hạn. Hãy nhờ Admin tạo link mới.');
++  // Firestore Security Rules enforce the 60-minute limit using SERVER request.time.
++  // Do not use Date.now() here: a phone with a wrong clock must not decide access.
++  if(inv.data().mode!=='multi'||inv.data().claimedBy||!inv.data().expiresAt)throw Error('Link mời thuộc phiên bản cũ hoặc không hợp lệ. Hãy nhờ Admin tạo link mới.');
++  if(used.exists())throw Error('Tài khoản này đã sử dụng link trước đó. Hãy liên hệ Admin để cấp lại quyền.');
+   tx.set(access,{
+    uid:user.uid,email:user.email||'',role:'member',active:true,inviteId:token,joinedAt:serverTimestamp(),
+   });
+-  tx.update(invite,{claimedBy:user.uid,claimedAt:serverTimestamp()});
++  tx.set(claim,{uid:user.uid,joinedAt:serverTimestamp()});
+   return 'joined';
+- });
++ });}
++ catch(error){
++  if(error?.code==='permission-denied')throw Error('Không thể nhận lời mời: link có thể đã hết 1 giờ, bị thu hồi hoặc Firestore Rules chưa cập nhật.');
++  throw error;
++ }
+ }
+ 
+ 
+diff --git a/firestore.rules b/firestore.rules
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -5,6 +5,18 @@
+     function accessPath() { return /databases/$(database)/documents/groups/sam-jqk/access/$(request.auth.uid); }
+     function accountPath(uid) { return /databases/$(database)/documents/groups/sam-jqk/access/$(uid); }
+     function invitePath(code) { return /databases/$(database)/documents/groups/sam-jqk/invites/$(code); }
++    function claimPath(code, uid) { return /databases/$(database)/documents/groups/sam-jqk/invites/$(code)/claims/$(uid); }
++    // Expiration uses Firestore SERVER request.time. Old single-use links lack mode=multi.
++    function inviteIsValid(code) {
++      return code is string && code.matches('^[0-9a-f]{48}$')
++        && exists(invitePath(code))
++        && get(invitePath(code)).data.mode == 'multi'
++        && get(invitePath(code)).data.createdAt is timestamp
++        && get(invitePath(code)).data.expiresAt is timestamp
++        && !('claimedBy' in get(invitePath(code)).data)
++        && get(invitePath(code)).data.expiresAt > request.time
++        && get(invitePath(code)).data.createdAt + duration.value(1, 'h') > request.time;
++    }
+     function role() {
+       return signedIn() && exists(accessPath()) && get(accessPath()).data.active == true
+         ? get(accessPath()).data.role : 'none';
+@@ -41,8 +53,8 @@
+         || (request.resource.data.payments.size() == request.resource.data.transferIds.size()
+             && request.resource.data.payments.values().hasOnly([true]));
+     }
+-    // Joining cannot grant any role except 'member'. Self-access and the invite claim
+-    // must be committed atomically; a random URL alone never has admin privileges.
++    // Joining never grants admin/editor. Each Google UID gets one immutable claim
++    // under the reusable invite. Both documents must be created in the same transaction.
+     function validSelfJoin(uid) {
+       let data = request.resource.data;
+       let code = data.get('inviteId', '');
+@@ -51,28 +63,25 @@
+         && data.keys().hasOnly(['uid','email','role','active','inviteId','joinedAt'])
+         && data.uid == uid && data.role == 'member' && data.active == true
+         && data.email is string && data.email == request.auth.token.email
+-        && code is string && code.size() == 48
+         && data.joinedAt == request.time
+-        && exists(invitePath(code))
+-        && get(invitePath(code)).data.expiresAt > request.time
+-        && !('claimedBy' in get(invitePath(code)).data)
+-        && getAfter(invitePath(code)).data.claimedBy == uid
+-        && getAfter(invitePath(code)).data.claimedAt == request.time;
++        && inviteIsValid(code)
++        && !exists(claimPath(code, uid))
++        && getAfter(claimPath(code, uid)).data.uid == uid
++        && getAfter(claimPath(code, uid)).data.joinedAt == request.time;
+     }
+-    function validInviteClaim(code) {
+-      return signedIn()
+-        && !('claimedBy' in resource.data)
+-        && resource.data.expiresAt > request.time
+-        && request.resource.data.diff(resource.data).affectedKeys().hasAll(['claimedBy','claimedAt'])
+-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedBy','claimedAt'])
+-        && request.resource.data.claimedBy == request.auth.uid
+-        && request.resource.data.claimedAt == request.time
+-        && !exists(accountPath(request.auth.uid))
+-        && getAfter(accountPath(request.auth.uid)).data.role == 'member'
+-        && getAfter(accountPath(request.auth.uid)).data.active == true
+-        && getAfter(accountPath(request.auth.uid)).data.uid == request.auth.uid
+-        && getAfter(accountPath(request.auth.uid)).data.inviteId == code
+-        && getAfter(accountPath(request.auth.uid)).data.joinedAt == request.time;
++    function validMemberClaim(code, uid) {
++      let data = request.resource.data;
++      return signedIn() && request.auth.uid == uid
++        && data.keys().hasAll(['uid','joinedAt'])
++        && data.keys().hasOnly(['uid','joinedAt'])
++        && data.uid == uid && data.joinedAt == request.time
++        && inviteIsValid(code)
++        && !exists(accountPath(uid))
++        && getAfter(accountPath(uid)).data.uid == uid
++        && getAfter(accountPath(uid)).data.role == 'member'
++        && getAfter(accountPath(uid)).data.active == true
++        && getAfter(accountPath(uid)).data.inviteId == code
++        && getAfter(accountPath(uid)).data.joinedAt == request.time;
+     }
+     match /groups/sam-jqk {
+       allow read, write: if false;
+@@ -93,20 +102,29 @@
+         allow delete: if isAdmin() && uid != request.auth.uid;
+       }
+       match /invites/{code} {
+-        // Bearer links contain 192 bits of entropy. Never allow listing by non-admins.
++        // 192-bit random bearer link; no public collection listing.
+         allow get: if signedIn();
+         allow list: if isAdmin();
+         allow create: if isAdmin()
+-          && code.size() == 48
+-          && request.resource.data.keys().hasAll(['createdAt','createdBy','expiresAt'])
+-          && request.resource.data.keys().hasOnly(['createdAt','createdBy','expiresAt'])
++          && code.matches('^[0-9a-f]{48}$')
++          && request.resource.data.keys().hasAll(['mode','createdAt','createdBy','expiresAt'])
++          && request.resource.data.keys().hasOnly(['mode','createdAt','createdBy','expiresAt'])
++          && request.resource.data.mode == 'multi'
+           && request.resource.data.createdBy == request.auth.uid
+           && request.resource.data.createdAt == request.time
+           && request.resource.data.expiresAt is timestamp
+           && request.resource.data.expiresAt > request.time
+-          && request.resource.data.expiresAt < request.time + duration.value(8, 'd');
+-        allow update: if validInviteClaim(code);
++          // Small clock tolerance for creating from a phone; joining is still
++          // strictly capped at server-side createdAt + 60 minutes.
++          && request.resource.data.expiresAt <= request.time + duration.value(61, 'm');
++        allow update: if false;
+         allow delete: if isAdmin();
++        match /claims/{uid} {
++          allow get: if (signedIn() && request.auth.uid == uid) || isAdmin();
++          allow list: if isAdmin();
++          allow create: if validMemberClaim(code, uid);
++          allow update, delete: if false;
++        }
+       }
+       match /meta/{id} {
+         allow get: if isMember();
