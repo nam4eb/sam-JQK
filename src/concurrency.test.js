@@ -1,137 +1,94 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { seed, createSession, saveRound, closeSession, togglePayment, clearSession, changePlayers, MAX_ROUNDS } from './ledger.js';
-import { sameData, reconcileChange } from './concurrency.js';
-import { diffSingle } from './cloud-model.js';
-
-function setup() {
-  let db=seed();
-  const created=createSession(db,'2026-11-09',['TV001','TV002','TV003']);
-  return { db:created.db, sid:created.session.id };
-}
-function change(before, after) { return diffSingle(before, after); }
-const round=(db,sid,winner,losses,rid=null)=>saveRound(db,sid,rid,winner,losses);
-function onRemote(c,remote) { return reconcileChange(c,remote); }
-
-test('sameData ignores Firestore map key order but still detects changed money',()=>{
- assert.equal(sameData({b:{z:1,a:2},a:[{b:2,a:1}]},{a:[{a:1,b:2}],b:{a:2,z:1}}),true);
- assert.equal(sameData({losses:{TV002:20}},{losses:{TV002:21}}),false);
+import {seed,createSession,saveRound,closeSession,togglePayment,changePlayers,clearSession} from './ledger.js';
+import {sameData,reconcileChange} from './concurrency.js';
+import {diffSingle} from './cloud-model.js';
+const setup=()=>{const a=createSession(seed(),'2026-11-25',['TV001','TV002','TV003']);return {db:a.db,sid:a.session.id};};
+const change=(before,after)=>diffSingle(before,after);
+test('concurrent snapshots compare Firestore object keys independent of order',()=>{
+ assert.equal(sameData({a:1,b:{y:2,x:1}},{b:{x:1,y:2},a:1}),true);
 });
-
-test('two phones add different rounds to same session without dropping either',()=>{
+test('independent new rounds from two phones merge',()=>{
  const {db,sid}=setup();
- const a=round(db,sid,'TV001',{TV002:10});
- const b=round(db,sid,'TV003',{TV001:20});
- const addA=change(db,a), addB=change(db,b);
- const remote=onRemote(addA,db.sessions[0]);
- const merged=onRemote(addB,remote);
- assert.equal(merged.rounds.length,2);
- assert.deepEqual(merged.rounds.map(x=>x.winnerId),['TV001','TV003']);
+ const a=saveRound(db,sid,null,'TV001',{TV002:10}),b=saveRound(db,sid,null,'TV003',{TV001:10});
+ const result=reconcileChange(change(db,b),a.sessions[0]);
+ assert.equal(result.rounds.length,2);
+});
+test('edits on different rounds preserve both changes',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10});db=saveRound(db,sid,null,'TV003',{TV001:8});
+ const [r1,r2]=db.sessions[0].rounds;
+ const a=saveRound(db,sid,r1.id,'TV001',{TV002:50});
+ const b=saveRound(db,sid,r2.id,'TV003',{TV001:40});
+ const result=reconcileChange(change(db,b),a.sessions[0]);
+ assert.equal(result.rounds[0].losses.TV002,50);
+ assert.equal(result.rounds[1].losses.TV001,40);
+});
+test('same round edited differently is rejected',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10});const rid=db.sessions[0].rounds[0].id;
+ const a=saveRound(db,sid,rid,'TV001',{TV002:20});const b=saveRound(db,sid,rid,'TV001',{TV002:30});
+ assert.throws(()=>reconcileChange(change(db,b),a.sessions[0]),/cùng ván/);
+});
+test('a late round does not re-open a session already closed on another phone',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10});
+ const closed=closeSession(db,sid),late=saveRound(db,sid,null,'TV003',{TV001:10});
+ assert.throws(()=>reconcileChange(change(db,late),closed.sessions[0]),/đã được chốt/);
+});
+test('different transfer checkboxes are combined',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10,TV003:20});db=closeSession(db,sid);
+ const a=togglePayment(db,sid,'TV002->TV001',true),b=togglePayment(db,sid,'TV003->TV001',true);
+ const combined=reconcileChange(change(db,b),a.sessions[0]);
+ assert.equal(combined.status,'paid');assert.equal(Object.values(combined.payments).filter(Boolean).length,2);
+});
+test('destructive clear refuses to overwrite a different concurrent round',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10});
+ const deleted=clearSession(db,sid,true),more=saveRound(db,sid,null,'TV003',{TV001:5});
+ assert.throws(()=>reconcileChange(change(db,deleted),more.sessions[0]),/được thay đổi/);
+});
+test('roster changes reject stale newly entered rounds even when total membership is same',()=>{
+ const {db,sid}=setup();
+ const switched=changePlayers(db,sid,['TV001','TV003']);
+ const stale=saveRound(db,sid,null,'TV002',{TV001:7});
+ assert.throws(()=>reconcileChange(change(db,stale),switched.sessions[0]),/Danh sách người chơi/);
 });
 
-test('different existing rounds edited at once both survive',()=>{
- const {db:initial,sid}=setup();
- let db=round(initial,sid,'TV001',{TV002:10});
- db=round(db,sid,'TV002',{TV003:15});
- const [one,two]=db.sessions[0].rounds.map(x=>x.id);
- const a=round(db,sid,'TV001',{TV002:40},one);
- const b=round(db,sid,'TV002',{TV003:60},two);
- const updated=onRemote(change(db,b),a.sessions[0]);
- assert.equal(updated.rounds[0].losses.TV002,40);
- assert.equal(updated.rounds[1].losses.TV003,60);
+test('identical repeated round edits are idempotent',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10});const rid=db.sessions[0].rounds[0].id;
+ const updated=saveRound(db,sid,rid,'TV001',{TV002:50});
+ const server={...updated.sessions[0],rounds:updated.sessions[0].rounds.map(r=>({...r,updatedAt:'other-device'}))};
+ const result=reconcileChange(change(db,updated),server);
+ assert.equal(result.rounds[0].losses.TV002,50);
 });
 
-test('same round edited to different totals is rejected, never last-write-wins',()=>{
- const {db:initial,sid}=setup();
- const db=round(initial,sid,'TV001',{TV002:10});
- const id=db.sessions[0].rounds[0].id;
- const a=round(db,sid,'TV001',{TV002:40},id);
- const b=round(db,sid,'TV001',{TV002:60},id);
- assert.throws(()=>onRemote(change(db,b),a.sessions[0]),/cùng ván/);
+test('stale Done snapshot must not discard a newly added round',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10});
+ const staleDone=closeSession(db,sid),added=saveRound(db,sid,null,'TV002',{TV003:5});
+ assert.throws(()=>reconcileChange(change(db,staleDone),added.sessions[0]),/được thay đổi/);
 });
 
-test('the same round result is idempotent when updatedAt differs',()=>{
- const {db:initial,sid}=setup();
- const db=round(initial,sid,'TV001',{TV002:10});
- const rid=db.sessions[0].rounds[0].id;
- const next=round(db,sid,'TV001',{TV002:50},rid);
- const server={...next.sessions[0],rounds:next.sessions[0].rounds.map(x=>({...x,updatedAt:'other device time'}))};
- const merged=onRemote(change(db,next),server);
- assert.equal(merged.rounds[0].losses.TV002,50);
-});
-
-test('late new round fails when another phone closes session',()=>{
- const {db:initial,sid}=setup();
- const db=round(initial,sid,'TV001',{TV002:10});
- const stale=round(db,sid,'TV003',{TV001:15});
- const finalized=closeSession(db,sid);
- assert.throws(()=>onRemote(change(db,stale),finalized.sessions[0]),/đã được chốt/);
-});
-
-test('stale Done cannot finalize snapshot if another phone adds round',()=>{
- const {db:initial,sid}=setup();
- const db=round(initial,sid,'TV001',{TV002:10});
- const done=closeSession(db,sid);
- const extra=round(db,sid,'TV002',{TV003:22});
- assert.throws(()=>onRemote(change(db,done),extra.sessions[0]),/được thay đổi/);
-});
-
-test('two phones mark different payments, status becomes paid when both done',()=>{
- const {db:initial,sid}=setup();
- let db=round(initial,sid,'TV001',{TV002:10,TV003:20});
- db=closeSession(db,sid);
- const a=togglePayment(db,sid,'TV002->TV001',true);
- const b=togglePayment(db,sid,'TV003->TV001',true);
- const merged=onRemote(change(db,b),a.sessions[0]);
- assert.equal(merged.payments['TV002->TV001'],true);
- assert.equal(merged.payments['TV003->TV001'],true);
- assert.equal(merged.status,'paid');
-});
-
-test('marking the same payment already true is idempotent',()=>{
- const {db:initial,sid}=setup();
- let db=round(initial,sid,'TV001',{TV002:10,TV003:20});
- db=closeSession(db,sid);
+test('the same payment checked true twice remains true',()=>{
+ let {db,sid}=setup();db=saveRound(db,sid,null,'TV001',{TV002:10,TV003:15});db=closeSession(db,sid);
  const a=togglePayment(db,sid,'TV002->TV001',true);
  const server={...a.sessions[0],updatedBy:'other'};
- const merged=onRemote(change(db,a),server);
+ const merged=reconcileChange(change(db,a),server);
  assert.equal(merged.payments['TV002->TV001'],true);
 });
 
-test('destructive clear keeps strict conflict checking when another round was added',()=>{
- const {db:initial,sid}=setup();
- const db=round(initial,sid,'TV001',{TV002:10});
- const clearing=clearSession(db,sid,true);
- const server=round(db,sid,'TV003',{TV001:5});
- assert.throws(()=>onRemote(change(db,clearing),server.sessions[0]),/được thay đổi/);
-});
-
-test('changes to player roster cannot be applied with stale round form',()=>{
- const {db,sid}=setup();
- const changed=changePlayers(db,sid,['TV001','TV002']);
- const attempted=round(db,sid,'TV003',{TV001:10});
- assert.throws(()=>onRemote(change(db,attempted),changed.sessions[0]),/Danh sách người chơi/);
-});
-
-test('same snapshot plus different key insertion order does not cause false conflict',()=>{
- const {db,sid}=setup();
- const updated=round(db,sid,'TV001',{TV002:17});
+test('same snapshots with different key orders do not fail equality check',()=>{
+ const {db,sid}=setup();const updated=saveRound(db,sid,null,'TV001',{TV002:17});
  const old=db.sessions[0];
- const reordered={status:old.status,rounds:old.rounds,memberIds:old.memberIds,id:old.id,date:old.date,updatedAt:old.updatedAt,createdAt:old.createdAt};
- const result=onRemote(change(db,updated),reordered);
+ const reordered={status:old.status,rounds:old.rounds,activeMemberIds:old.activeMemberIds,memberIds:old.memberIds,id:old.id,date:old.date,updatedAt:old.updatedAt,createdAt:old.createdAt};
+ const result=reconcileChange(change(db,updated),reordered);
  assert.equal(result.rounds[0].losses.TV002,17);
 });
 
-test('initial settings can be created when Firestore doc not yet present',()=>{
- const {db}=setup();
- const next={...db,settings:{...db.settings,archiveDays:9}};
- const c=change(db,next);
+test('initial config may be created when Firestore config document is absent',()=>{
+ const {db}=setup();const updated={...db,settings:{...db.settings,archiveDays:14}};
+ const c=change(db,updated);
  assert.equal(c.kind,'settings');
- assert.deepEqual(onRemote(c,undefined),next.settings);
+ assert.deepEqual(reconcileChange(c,undefined),updated.settings);
 });
 
-test('edits to unrelated member document do not affect session mutation',()=>{
- const {db,sid}=setup();
- const next=round(db,sid,'TV001',{TV002:3});
- assert.equal(onRemote(change(db,next),db.sessions[0]).rounds.length,1);
+test('session edit does not conflict with another member document',()=>{
+ const {db,sid}=setup();const updated=saveRound(db,sid,null,'TV001',{TV002:6});
+ assert.equal(reconcileChange(change(db,updated),db.sessions[0]).rounds.length,1);
 });

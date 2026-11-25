@@ -39,4 +39,5 @@ for (const guard of inviteGuards) {
     throw Error('Invite v3.2 security rules missing: ' + guard);
   }
 }
-console.log('Preflight OK: Firebase rules, reusable 1-hour invite claims, 4 roles, web config, workflow, React files present.');
+if(!rules.includes('activeMemberIds') || !rules.includes('size() <= 100'))throw Error('Rolling session roster security rules missing');
+console.log('Preflight OK: Firebase rules, 1-hour multi-invite, rolling session roster, 4 roles, web config and workflow.');

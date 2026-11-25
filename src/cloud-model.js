@@ -1,5 +1,5 @@
 /** Pure Firestore model helpers; tested without Firebase or browser APIs. */
-import {isDatabase,settlementTransfers,nowIso} from './ledger.js';
+import {isDatabase,settlementTransfers,nowIso,MAX_PLAYERS,SAM_LOSS,BURN_LOSS,CATCH_TWO} from './ledger.js';
 
 export const emptyCloudDb = () => ({schema:1,createdAt:nowIso(),updatedAt:nowIso(),members:[],sessions:[],settings:{unit:'nghìn đồng',archiveDays:7}});
 
@@ -45,7 +45,15 @@ export function prepareImport(data){
  if(known.size!==members.length)throw Error('Trùng mã thành viên.');
  const sessions=data.sessions.map(s=>{
   if(!validDocId(s.id)||s.memberIds.some(mid=>!known.has(mid))||s.memberIds.length<2&&s.rounds.length>0)throw Error('Dữ liệu phiên có thành viên hoặc mã không hợp lệ.');
-  for(const r of s.rounds){if(!validDocId(r.id)||!s.memberIds.includes(r.winnerId)||Object.keys(r.losses||{}).some(k=>!s.memberIds.includes(k)||k===r.winnerId||!Number.isFinite(+r.losses[k])||+r.losses[k]<0))throw Error('Có ván không hợp lệ.');}
+  if(s.activeMemberIds && (!Array.isArray(s.activeMemberIds)||s.activeMemberIds.length>MAX_PLAYERS||s.activeMemberIds.some(mid=>!s.memberIds.includes(mid))))throw Error('Danh sách đang chơi không hợp lệ.');
+  for(const r of s.rounds){
+   const people=r.participantIds||s.memberIds;
+   if(!validDocId(r.id)||!Array.isArray(people)||people.length<2||people.length>MAX_PLAYERS||new Set(people).size!==people.length||people.some(mid=>!s.memberIds.includes(mid))||!people.includes(r.winnerId)||Object.keys(r.losses||{}).some(k=>!people.includes(k)||k===r.winnerId||!Number.isFinite(+r.losses[k])||+r.losses[k]<0))throw Error('Có ván không hợp lệ.');
+   if(r.kind==='sam'&&people.some(mid=>mid!==r.winnerId&&r.losses?.[mid]!==SAM_LOSS))throw Error('Ván báo sâm có tiền thua không hợp lệ.');
+   if(r.kind&& !['normal','sam'].includes(r.kind))throw Error('Loại ván không hợp lệ.');
+   if(r.burnedIds && (!Array.isArray(r.burnedIds)||r.burnedIds.some(mid=>!people.includes(mid)||mid===r.winnerId||(r.losses[mid]||0)<BURN_LOSS)))throw Error('Tiền cháy không hợp lệ.');
+   if(r.catches && (!Array.isArray(r.catches)||r.catches.length>20||r.catches.some(c=>!people.includes(c.fromId)||!people.includes(c.toId)||c.toId===c.fromId||c.amount!==CATCH_TWO)))throw Error('Dữ liệu bắt 2 không hợp lệ.');
+  }
   const normalized=normalizeSession({...s,createdAt:s.createdAt||nowIso(),updatedAt:s.updatedAt||nowIso()});
   const bytes=new TextEncoder().encode(JSON.stringify(normalized)).byteLength;
   if(bytes>850000)throw Error('Phiên '+s.id+' quá lớn để lưu một document.');

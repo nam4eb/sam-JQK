@@ -38,10 +38,13 @@ service cloud.firestore {
         && request.resource.data.get('qrImage','').size() <= 700000;
     }
     function safeSession() {
-      return request.resource.data.keys().hasOnly(['id','date','memberIds','rounds','status','createdAt','updatedAt','updatedBy','snapshot','payments','transferIds','paidAt','closedAt','autoClosed'])
+      return request.resource.data.keys().hasOnly(['id','date','memberIds','rounds','status','createdAt','updatedAt','updatedBy','snapshot','payments','transferIds','paidAt','closedAt','autoClosed','activeMemberIds'])
         && request.resource.data.id is string
         && request.resource.data.date is string
-        && request.resource.data.memberIds is list && request.resource.data.memberIds.size() <= 10
+        && request.resource.data.memberIds is list && request.resource.data.memberIds.size() <= 100
+        && request.resource.data.get('activeMemberIds', request.resource.data.memberIds) is list
+        && request.resource.data.get('activeMemberIds', request.resource.data.memberIds).size() <= 10
+        && request.resource.data.get('activeMemberIds', request.resource.data.memberIds).hasOnly(request.resource.data.memberIds)
         && request.resource.data.rounds is list && request.resource.data.rounds.size() <= 200
         && request.resource.data.status in ['active','done','paid']
         && request.resource.data.get('transferIds',[]) is list

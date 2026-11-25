@@ -21,19 +21,12 @@ export function sameData(a, b) {
   const bKeys = Object.keys(b).filter(k => b[k] !== undefined).sort();
   return aKeys.length === bKeys.length && aKeys.every((k, i) => k === bKeys[i] && sameData(a[k], b[k]));
 }
-
-function without(obj, keys) {
-  return Object.fromEntries(Object.entries(obj || {}).filter(([k]) => !keys.includes(k)));
-}
+function without(obj, keys) { return Object.fromEntries(Object.entries(obj || {}).filter(([k]) => !keys.includes(k))); }
 function sameExcept(a, b, keys) { return sameData(without(a, keys), without(b, keys)); }
 function fail(message = CHANGED) { throw new Error(message); }
 function byId(rounds) { return new Map((rounds || []).map(r => [r.id, r])); }
-function sameRoundContent(a, b) {
-  return sameExcept(a, b, ['updatedAt']);
-}
-function playerSetMatches(a, b) {
-  return sameData(a.memberIds, b.memberIds) && a.date === b.date && a.createdAt === b.createdAt;
-}
+function sameRoundContent(a, b) { return sameExcept(a, b, ['updatedAt']); }
+function playerSetMatches(a, b) { return sameData(a.memberIds, b.memberIds) && sameData(a.activeMemberIds || a.memberIds, b.activeMemberIds || b.memberIds) && a.date === b.date && a.createdAt === b.createdAt; }
 function roundChange(before, after) {
   if (!before || !after || before.status !== 'active' || after.status !== 'active') return null;
   if (!sameExcept(before, after, ['rounds', 'updatedAt', 'updatedBy'])) return null;
@@ -41,12 +34,8 @@ function roundChange(before, after) {
   const added = [...next.keys()].filter(id => !prev.has(id));
   const removed = [...prev.keys()].filter(id => !next.has(id));
   const edited = [...prev.keys()].filter(id => next.has(id) && !sameRoundContent(prev.get(id), next.get(id)));
-  // Only opt in to lossless merge for adding ONE round or changing ONE existing round.
-  // Clearing the day, deleting rounds, and bulk edits retain strict conflict checks.
-  if (added.length === 1 && !removed.length && !edited.length)
-    return { kind: 'add', round: next.get(added[0]) };
-  if (edited.length === 1 && !removed.length && !added.length)
-    return { kind: 'edit', id: edited[0], before: prev.get(edited[0]), after: next.get(edited[0]) };
+  if (added.length === 1 && !removed.length && !edited.length) return { kind: 'add', round: next.get(added[0]) };
+  if (edited.length === 1 && !removed.length && !added.length) return { kind: 'edit', id: edited[0], before: prev.get(edited[0]), after: next.get(edited[0]) };
   return null;
 }
 function paymentChange(before, after) {
@@ -58,11 +47,6 @@ function paymentChange(before, after) {
   if (changed.length !== 1) return null;
   return { id: changed[0], wasChecked: p[changed[0]] === true, checked: n[changed[0]] === true };
 }
-
-/**
- * Called only if the user's original session snapshot differs from the remote one.
- * Returns a merged session on safe non-overlapping edits. Unsafe conflicts throw.
- */
 export function mergeSessionChange(before, after, remote) {
   if (!before || !after || !remote) fail();
   const rounds = roundChange(before, after);
@@ -96,25 +80,20 @@ export function mergeSessionChange(before, after, remote) {
     if (payment.checked) payments[payment.id] = true; else delete payments[payment.id];
     return normalizeSession({ ...remote, payments, paidAt: remote.paidAt || null });
   }
-  // Metadata-only differences (writer/timestamp) should never cause a conflict.
   if (sameExcept(before, remote, ['updatedAt', 'updatedBy'])) return { ...remote, ...after };
   fail();
 }
-
-/** Applies one intended document change against a live transaction snapshot. */
 export function reconcileChange(change, remote) {
   if (change.previous === undefined) {
     if (remote !== undefined) fail('Mục đã được tạo trên một thiết bị khác.');
     return change.next;
   }
   if (remote === undefined) {
-    if (change.kind === 'settings') return change.next; // initial settings doc does not yet exist
+    if (change.kind === 'settings') return change.next;
     fail('Dữ liệu đã bị xóa từ thiết bị khác.');
   }
   if (sameData(change.previous, remote)) return change.next;
-  if (change.kind === 'sessions' && change.next !== null)
-    return mergeSessionChange(change.previous, change.next, remote);
-  if (sameExcept(change.previous, remote, ['updatedAt', 'updatedBy']))
-    return change.next === null ? null : { ...remote, ...change.next };
+  if (change.kind === 'sessions' && change.next !== null) return mergeSessionChange(change.previous, change.next, remote);
+  if (sameExcept(change.previous, remote, ['updatedAt', 'updatedBy'])) return change.next === null ? null : { ...remote, ...change.next };
   fail();
 }
